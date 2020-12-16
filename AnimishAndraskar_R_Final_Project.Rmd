@@ -1,0 +1,549 @@
+---
+title: "94-842 Programming R for Analytics"
+subtitle: "Final Project"
+author: "Animish Andraskar"
+date: "Submission Date: 13 Dec 2019"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: paper
+    highlight: tango
+---
+
+```{r load libraries, message = FALSE, echo = FALSE}
+options(warn = -1) # To hide package compatibility warnings
+library(tidyverse)
+library(corrplot)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(ggpubr)
+library(caTools)
+library(randomForest)
+set.seed(2)
+```
+
+# Project overview
+
+This R Markdown file contains the end to end data analysis done on the "Cleveland Heart Disease" data set. In this project, we are trying to identify key factors or predictors which will help us determine what kinds of health attributes indicate the risk of heart disease.
+
+When the data was generated, there were a total of 76 attributes captured. But finally, 14 important attributes were published by the researchers. We will also use the same 14 attributes or the dependent variables for our analysis. The variables are:
+
+- `age`: age in years
+- `sex`: (1 = male; 0 = female)
+- `cp`:  chest pain type (0 = typical angina; 1 = atypical angina; 2 = non-anginal pain; 3 = asymptomatic)
+- `trestbps`:  resting blood pressure (in mm Hg on admission to the hospital)
+- `chol`:  serum cholestoral in mg/dl
+- `fbs`: fasting blood sugar > 120 mg/dl (1 = true; 0 = false)
+- `restecg`: resting electrocardiographic results
+- `thalach`: maximum heart rate achieved
+- `exang`: exercise induced angina (1 = yes; 0 = no)
+- `oldpeak`: ST depression induced by exercise relative to rest
+- `slope`: the slope of the peak exercise ST segment (0 = upsloping; 1 = flat, 2 = downsloping)
+- `ca`:  number of major vessels (0-3) colored by flourosopy
+- `thal`: A blood disorder called thalassemia (0 = unknown; 1 = normal; 2 = fixed defect; 3 = reversable defect)
+
+The target variable or the "labels" for heart disease are stored under "target" column. Initially this column had up to 4 levels of heart disease, but for simplification the column has been made binary. This will be our dependent variable in the analysis.
+
+- `target`: presence of heart disease (0 = yes; 1 = no)
+
+In our analysis, we will first understand what all information the data set contains with the help of R. Then we will build different predictive models for our predictions and compare them against each other. Ultimately, we will choose the best performing model or a combination of models to build our final prediction engine. Let's go!
+
+(**Original publishers of the dataset** -  https://archive.ics.uci.edu/ml/datasets/Heart+Disease)
+
+# Data exploration
+
+### File reading
+
+Read the file.
+
+```{r define the data set}
+# Make sure the cas is in the same folder as this notebook and that folder is set as working directory
+dataset <- read.csv("heart.csv", encoding="UTF-8-BOM")
+# shuffle rows so that we see a good mix of different values in the output
+dataset <- dataset[sample(nrow(dataset)), ]
+head(dataset)
+```
+
+The dataset has **`r nrow(dataset)`** rows and **`r ncol(dataset)`** columns.
+
+Let's have a look at the columns read from the data set and make them more user friendly, if there is a scope.
+
+```{r column names}
+names(dataset)
+```
+
+Age column needs renaming.
+
+```{r column name adjustment}
+# rename age column
+names(dataset)[1] <- "age"
+# let's check the column names again
+names(dataset)
+```
+
+### Data summary
+
+Have a look at the summary and the structure of the dataset and make sure we have all the variables.
+
+```{r data structure}
+summary(dataset)
+str(dataset)
+cat.vars <- c("sex", "cp", "ca", "fbs", "restecg", "exang", "slope", "thal", "target")
+num.vars <- setdiff(names(dataset), cat.vars)
+```
+We can see that all the variables we need are present in the file. However, there is one thing we need to fix, and that is the variable types. Variables like sex, cp, restecg, fbs etc. are categorical but characterized as int. We will fix that below.
+
+### Null value check
+
+Let's check if any variable has null values.
+
+```{r null check}
+# Traverse each column and check for null values
+for(name in names(dataset)) {
+  print(paste(name, "column contains", sum(is.na(dataset[, name])), "null values"))
+}
+```
+
+We can see that there are no null values in any column.
+
+### First glance at data distribution
+
+Look at the distribution of each column.
+
+```{r variable distributions, fig.height=7, fig.width=10}
+# plot histograms of all variables to see how they are distributed
+dataset %>%
+  # gather columns into key value pairs
+  gather() %>%
+  # plot histogram with each graph having independent axes
+  ggplot(aes(as.numeric(value))) + facet_wrap(~ key, scales = "free") + geom_bar() + scale_x_continuous(breaks = function(x, n = 5) pretty(x, n)[pretty(x, n) %% 1 == 0] )
+```
+
+```{r numeric boxplots}
+# plot boxplot of all numeric variables to see how their values are distributed
+dataset[, num.vars] %>%
+  # gather columns into key value pairs
+  gather() %>%
+  # generate boxplot with each graph having independent axes
+  ggplot(aes(key, as.numeric(value))) + facet_wrap(~ key, scales = "free") + geom_boxplot()
+```
+
+```{r correlations}
+# correlation plot
+corrdata <- cor(dataset[, num.vars])
+corrplot(corrdata)
+# correlation values
+round(cor(dataset[, num.vars]), 2)
+```
+
+Very first thing we notice is that there are outliers in all the numeric columns except `age`. We need to treat outliers by removing them.
+
+Second thing to notice is that moderate collinearity exists in `thalach ~ age` (correlation coefficient -0.4) and `thalach ~ oldpeak` (correlation coefficient -0.34) pairs. We will deal with this as well.
+
+Lastly, we must notice is that the dependent variable `target` is a bit imbalanced with 1 slightly overpowering 0. We need to rebalance that as well.
+
+# Data treatment
+
+Let's treat our data based on our observations in the previous step.
+
+### Fixing column types
+
+We saw above that certain columns, which are supposed to be categorical are treated as numeric. We need to fix their data types.
+
+```{r new data types}
+for(var in cat.vars) {
+  dataset[[var]] <- factor(dataset[[var]])
+}
+str(dataset)
+```
+
+### Handling outliers
+
+To make sure that the model/s we build are optimized and accurate, we will remove rows with outliers.
+
+```{r outlier removal}
+total.rows.removed = 0
+for(var in num.vars) {
+  rows.deleted <- nrow(dataset[which(dataset[, var] %in% boxplot.stats(dataset[, var])$out),])
+  total.rows.removed = total.rows.removed + rows.deleted
+  dataset <- dataset[which(!dataset[, var] %in% boxplot.stats(dataset[, var])$out),]
+  print(paste0(rows.deleted, " rows deleted for having outlying values of ", var))
+}
+```
+
+Total rows removed are **`r total.rows.removed`**.
+
+### Multicollinearity removal
+
+Earlier, we observed a moderate collinearity in `thalach ~ age` (coefficient -0.4) and `thalach ~ oldpeak` (coefficient -0.34) variable pairs. These two correlations are quite obvious.
+
+- `thalach` is maximum heart rate achieved (HRmax). The formula for calculating target HRmax is `0.9 * (220 - age)`. So, as age increases, HRmax decreases. (Reference: http://www.turnstep.com/Faq/heartrate.html)
+- Similarly, as HRmax decreases, `oldpeak` (achieved response to stress test) increases as it becomes easy to displace J point below the baseline with decreased heart rate. (Reference: https://www.ncbi.nlm.nih.gov/books/NBK459364/)
+
+Hence, `thalach` provides redundant information and it would be wise to remove it from the analysis.
+
+```{r multicollinearity removal}
+# remove thalach column
+dataset <- dataset[, !(names(dataset) == "thalach")]
+# update numeric variables list
+num.vars <- num.vars[num.vars != 'thalach']
+```
+
+### Data rebalancing
+
+Let's now identify the difference between occurrances of 0's and 1's in `target`, and fix the imbalance.
+
+```{r target imbalance}
+zeros = sum(dataset$target == 0)
+ones = sum(dataset$target == 1)
+paste("Number of 0's in target variable:", zeros)
+paste("Number of 1's in target variable:", ones)
+# let's store the difference dynamically
+target.imbalance = max(zeros, ones) - min(zeros, ones)
+
+if(max(zeros, ones) == zeros) { # Zeros overpower
+  print(paste0("Zeros overpower ones with a difference of ", target.imbalance,
+               ". Hence we will add some random samples of rows with target 1 to the dataset"))
+  # More samples of 1's need to be added
+  sampled.rows <- sample_n(dataset[which(dataset$target == 1),], target.imbalance)
+  sampled = "ones"
+} else if(max(zeros, ones) == ones) { # Ones overpower
+  print(paste0("Ones overpower zeros with a difference of ", target.imbalance,
+               ". Hence we will add some random samples of rows with target 0 to the dataset"))
+  # More samples of 0's need to be added
+  sampled.rows <- sample_n(dataset[which(dataset$target == 0),], target.imbalance)
+  sampled = "zeros"
+} else { # No imbalance
+  "No imbalance"
+  sampled.rows <- NULL
+  sampled = "no rows"
+}
+
+# Combine all rows
+dataset <- rbind(dataset, sampled.rows)
+```
+
+We have added `r target.imbalance` randomly sampled rows with target `r sampled` to the data. Both zeros and ones have `r max(zeros, ones)` observations, and the total number of rows now is `r nrow(dataset)`.
+
+### Treated data distribution
+
+Now that we have balanced the data, let's look at the distribution of the data columns again.
+
+```{r distribution after treatment, fig.height=7, fig.width=10}
+# plot histograms of all variables to see how they are distributed
+dataset %>%
+  # gather columns into key value pairs
+  gather() %>%
+  # plot histogram with each graph having independent axes
+  ggplot(aes(as.numeric(value))) + facet_wrap(~ key, scales = "free", ncol = 4) + geom_bar() +
+  scale_x_continuous(breaks = function(x, n = 5) pretty(x, n)[pretty(x, n) %% 1 == 0] )
+```
+
+```{r boxplots after treatment}
+# plot boxplot of all numeric variables to see how their values are distributed
+dataset[, num.vars] %>%
+  # gather columns into key value pairs
+  gather() %>%
+  # generate boxplot with each graph having independent axes
+  ggplot(aes(key, as.numeric(value))) + facet_wrap(~ key, scales = "free") + geom_boxplot()
+```
+
+```{r correlations after treatment}
+# correlation plot
+corrdata <- cor(dataset[, num.vars])
+corrplot(corrdata)
+# correlation values
+round(cor(dataset[, num.vars]), 2)
+```
+
+The data distribution is now balanced and free of outliers or multicollinearity. We have treated our data and we are ready for performing the further analyses.
+
+# Exploratory data analysis
+
+### Ocurrance of heart disease by variables
+
+To understand how occurrance of heart disease varies with different variables, we will form hypotheses at variable level and test them one by one.
+
+#### Age
+
+We know that age age increases, risk of heart disease goes up. That essentially means, age distribution among those who have heart disease is significantly different than that among those who don't have a heart disease. And also, we expect the ages to be higher in target = 0 compared to target = 1 (recall that target = 0 is presence of heart disease and 1 is the opposite).
+
+```{r age target}
+ggplot(dataset, aes(x = age, fill = target)) + geom_density(alpha=0.5)
+```
+We can see that the distributions of age look quite different. In fact, it is exactly what we assumed initially - probability of ocurrance of heart disease is higher in old age.
+
+```{r age ttest}
+t.test(dataset$age[which(dataset$target == 0)], dataset$age[which(dataset$target == 1)])
+```
+
+We can see that the distributions are significantly different. The t-score is 4.45, which is far above the threshold, t* = 1.96 for significance level 5%.
+
+We reject the null hypothesis that the two age distributions are the same and can conclude that they are different. We can also conclude that the probability of encountering heart disease is higher in old age.
+
+#### Gender
+
+Various sources (like https://wa.kaiserpermanente.org/healthAndWellness/index.jhtml?item=/common/healthAndWellness/conditions/heartDisease/ageAndGender.html) say that the risk of heart disease is higher for men compared to women. Let's see what our data says about that (sex = 1 means male and sex = 0 means female).
+
+```{r gender target}
+ggplot(dataset, aes(x = sex, fill = target)) + geom_bar()
+```
+
+Even though the number of female observations in our dataset is less than half of that of male observations, the proportion in target = 1 is not that disparate. In fact, contrary to our assumption, the probability of ocurrance of heart disease is drastically higher in males than females.
+
+Let's do a significance test for that.
+
+```{r sex chisq}
+chisq.test(dataset$sex, dataset$target)
+```
+
+The p-value is extremely low for our significance level of 5%. So, the test says that gender and terget are heavily dependent on each other, or in other words, sex significantly matters in the occurrance of heart disease.
+
+An interesting thing to do here would be to combine age and gender.
+
+#### Age and gender combined
+
+The source mentioned above also says that men develop heart disease at an early age compared to women. Let's check that in our data.
+
+```{r age distribution, fig.height=7, fig.width=10}
+ggplot(dataset, aes(x= age, y = sex, colour=target)) + geom_jitter(width = 0.2)
+```
+
+From the above graph, it is very clear that age ranges for heart disease occurrance are very different for the two genders.
+
+If we look at sex = 0 row, we can see that blue points are quite evenly distributed across age but the orange points are more distributed between 55 to 65. That means, occurrance of heart disease is common in aged females and not in youth.
+
+On the other hand, for males, both the types of points are evenly distributed across age. This means, young as well as old males are prone to heart disease. The results are in line with our assumption that men develop heart disease more than women and the risk is no less at an early age.
+
+#### Blood pressure
+
+A very interesting variable to look at will be (resting) blood pressure as risk of heart disease is positively associated with blood pressure. Ideally, we should see high blood pressure in patients with heart disease. Let's check if the data says the same.
+
+```{r bp target}
+ggplot(dataset, aes(x = trestbps, fill = target)) + geom_density(alpha = 0.5)
+```
+
+Though we see target = 0 on slight right side of target = 1, it is not clear whether these two distributions are essentially different. Let's verify that with t t-test.
+
+```{r bp ttest}
+t.test(dataset$trestbps[which(dataset$target == 0)], dataset$trestbps[which(dataset$target == 1)])
+```
+
+The t-test clearly shows that the two distributions are not significantly different, meaning resting blood pressure is not a strong factor in determining heart disease.
+
+#### Chest pain (angina)
+
+Another very interesting variable to look at would be chest pain. Heart and chest pains are very closely related. But the main thing to know here would be what type of chest pain is stronger indicator of heart disease.
+
+(cp: 0 = typical angina; 1 = atypical angina; 2 = non-anginal pain; 3 = asymptomatic)
+
+```{r chect pain target}
+ggplot(dataset, aes(x = cp, fill = target)) + geom_bar()
+```
+
+The risk of heart disease is the highest with typical angina (cp = 0) and then with non-anginal pain (cp = 2).
+
+Let's veryfy the dependence with a chi square test.
+
+```{r cp chisq}
+chisq.test(dataset$cp, dataset$target)
+```
+
+The p-value is close to 0, which indicates a heavy dependence between chest pain type and heart disease.
+
+#### Cholestoral
+
+Cholestoral is probably the most talked about health term with people being superconscious about their cholestoral levels. This is because cholestoral is very highly associated with ocurrance of heart disease.
+
+```{r chol target}
+ggplot(dataset, aes(x = chol, fill = target)) + geom_density(alpha = 0.5)
+```
+
+And, as expected, higher cholestrol is associated with heart disease. Let's verify that statistically.
+
+```{r chol ttest}
+t.test(dataset$chol[which(dataset$target == 0)], dataset$chol[which(dataset$target == 1)])
+```
+
+With a p-value of 0.045, the test is significant with significance level of 5% and we can conclude that the two distributions are essentially different, meaning cholestoral can be a determining factor for heart disease.
+
+#### Blood sugar
+
+Similar to the previous parts, we will test if blood sugar (fasting blood sugar > 120 mg/dl - 1 = true and 0 = false) determines presence of heart disease.
+
+```{r fbs analysis}
+ggplot(dataset, aes(x = fbs, fill = target)) + geom_bar()
+chisq.test(dataset$fbs, dataset$target)
+```
+
+From both distribution and the significance test, we can see that fasting blood sugar actually doesn't differ with heart disease.
+
+#### Electrocardiographic results
+
+Rest electrocardiographic results can be a good predictor of heart disease.
+
+(We are ignoring restecg = 2 as it has only 2 ocurrances in the data)
+
+```{r restecg analysis}
+ggplot(dataset[which(dataset$restecg != 2),], aes(x = restecg, fill = target)) + geom_bar()
+chisq.test(dataset[which(dataset$restecg != 2),]$restecg, dataset[which(dataset$restecg != 2),]$target)
+```
+
+ECG results is indeed a good predictor.
+
+#### Exercise induced angina
+
+From previous results, we know that angina (chest pain) is a good predictor of heart disease. Let's see if the same holds true for induced angina (exang: 1 = yes; 0 = no).
+
+```{r exang analysis}
+ggplot(dataset, aes(x = exang, fill = target)) + geom_bar()
+chisq.test(dataset$exang, dataset$target)
+```
+
+As expected, induced angina is also a good predictor of heart disease.
+
+#### ST depression
+
+ST depression is stress test to check the heart health. It occurs when J point displaces below the baseline on the ecg, and represents myocardial ischemia or an emergent condition of heart disease. ST depression level, ideally, should be strongly associated with heart disease.
+
+```{r oldpeak analysis}
+ggplot(dataset, aes(x = oldpeak, fill = target)) + geom_density(alpha = 0.5)
+t.test(dataset$oldpeak[which(dataset$target == 0)], dataset$oldpeak[which(dataset$target == 1)])
+```
+
+Higher ST depression measuring relates to occurrance of heart disease and ST depression in itself is a strong indicator of heart disease with p-value close to 0.
+
+#### Peak exercise ST segment
+
+A stress test (slope: 0 = upsloping; 1 = flat; 2 = downsloping) can determine the risk of having heart disease. A treadmill ECG stress test is considered abnormal when there is a flat or down-sloping ST-segment depression. (Reference: https://www.webmd.com/heart-disease/guide/stress-test#1).
+
+```{r slope analysis}
+ggplot(dataset, aes(x = slope, fill = target)) + geom_bar()
+chisq.test(dataset$slope, dataset$target)
+```
+
+#### Thalassemia
+
+Thalassemia (thal: 1 = normal; 2 = fixed defect; 3 = reversable defect) is a blood disorder and it is an indicator of possibility of heart disease. We are ignoring thal = 0 here because it is unknown in our data.
+
+```{r thalassemia analysis}
+ggplot(dataset[which(dataset$thal != 0),], aes(x = thal, fill = target)) + geom_bar()
+chisq.test(dataset[which(dataset$thal != 0),]$thal, dataset[which(dataset$thal != 0),]$target)
+```
+
+It can be seen that thalassemia is a strong predictor of heart disease with p-value close to 0 and reversible defect denotes presence of heart disease.
+
+#### Major blood vessels
+
+Though, the meaning if this variable is not clear from the data description on Kaggle as well as anywhere else on internet, we will just see how it performs. There are 5 major blood vessels in human body. But which one is denoted by which number in the data is not clear to us.
+
+```{r vessel analysis}
+ggplot(dataset, aes(x = ca, fill = target)) + geom_bar()
+chisq.test(dataset$ca, dataset$target)
+```
+
+The variable has significant association with heart disease, and, except for 0th and 4th blood vessels, heart disease rate is high in the blood vessels colored by flourosopy.
+
+### Conclusion of EDA
+
+From the exploratory data analysis, we can conclude that the 14 variables included in the data (out of 76 total) are a very good set of predictors. We can build some good models to predict the risk of heart disease.
+
+# Classification models
+
+With such strong predictors, there will be numerous models that can be trained with the data to predict the risk of ocurrance of heart disease. But we will look at some key models which are highly relevant.
+
+### Training and testing data
+
+Let's split the data into training and testing datasets having 5:1 ratio.
+
+```{r train test split}
+sample = sample.split(dataset, SplitRatio = 0.8)
+train =subset(dataset, sample == TRUE)
+test =subset(dataset, sample == FALSE)
+summary(train)
+summary(test)
+```
+
+Training data has **`r nrow(train)`** rows and test data has **`r nrow(test)`** rows.
+
+### Logistic regression
+
+With strong categorical predictors for classification, logistic regression can be a good choice for classification.
+
+```{r logistic regression}
+logistic.model <- glm(target ~ ., data = train, family = "binomial")
+summary(logistic.model)
+```
+
+Some strong indicators of heart disease churned out by the model are:
+
+- 1st artery colored by fluroscopy (ca = 1)
+- 2nd artery by fluroscopy (ca = 2)
+- Male (sex = 1)
+- Non-anginal pain (cp = 2)
+- Asymptomatic agina (cp = 3)
+
+Let's test the model on the test data.
+
+```{r logistic testing}
+logistic.probabilities <- predict(logistic.model, newdata = test, type="response")
+# convert probabilities into predictions. 1 if >= 0.5 and 0 if < 0.5
+logistic.predictions <- as.factor(ifelse(logistic.probabilities >= 0.5, 1, 0))
+confusionMatrix(logistic.predictions, test$target)
+```
+
+The confusion matrix says that the model is 85% accurate. 33 out of 42 occurrances of heart disease were predicted correctly by the model, and 30 out of 32 non-ocurrances of heart disease were predicted accurately.
+
+### Decision trees
+
+When we have many categorical predictors, decision trees come handy at leading us to some good classification rules.
+
+```{r decision trees}
+dt.model <- rpart(target ~ ., data=dataset)
+prp(dt.model)
+```
+
+The tree above shows some key rules for heart desease prediction. Leaves with value 0 indicate ocurrance of heart disease and 1 denotes absense. An example rule of presence of heart desease could be 'normal' or 'reversible' thalassemia and '0th blood vessel' colored by fluroscopy.
+
+Validation:
+
+```{r dt validation}
+dt.predictions <- predict(dt.model, newdata = test, type = "class")
+confusionMatrix(dt.predictions, test$target)
+```
+
+The accuracy achieved is 89% with 36 out of 42 ocurrances being predicted accurately and 30 out of 32 non-occurrances being predicted correctly.
+
+### Random forest
+
+The decision tree we built above can be prone to overfitting and also, the random state the program currently is in. In such cases, an ensemble model like like random forest can yield more accurate and unbiased results.
+
+Let's try building a random forest model with 100 decision trees.
+
+```{r random forest}
+rf.model <- randomForest(target ~ ., data=dataset, ntree = 100)
+summary(rf.model)
+```
+
+Let's check the model performance on the test data.
+
+```{r rf validation}
+rf.predictions <- predict(rf.model, newdata = test, type = "class")
+confusionMatrix(rf.predictions, test$target)
+```
+
+The accuracy achieved by the model is 100%! This is the magic of randomization and ensembling. Creator of Random Forest algorithm, Leo Breiman, says that random forest doesn't overfit (https://www.stat.berkeley.edu/~breiman/RandomForests/cc_home.htm#remarks).
+
+With that, we can use random forest as a trustworthy model for predicting the risk of heart disease.
+
+### Conclusion of classification exercise
+
+We built 3 classifier models on the data we have. Random Forest turned out to be an effective classifier.
+
+# Final remarks
+
+In thie project, we took a shot at crunching the data and doing some analysis on D=Cleveland heart disease data. We first performed basic data treatments, then we did some EDA to verify that the predictors we are including really make sense and finally, we built 3 classifiers.
+
+Of course, this is just a stepping stone into the field of data analytics. This analysis can be enhanced further with the help of other advanced classification techniques and validation methodologies like k-fold cross validation.
